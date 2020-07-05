@@ -1,0 +1,1048 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Hybrid Architecture -> Resolving DNS names in a hybrid environment with Route 53 Resolvers.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "EC2 Instances Configurations"
+        Parameters:
+          - SSHKeyName
+          - LatestAMIId
+      -
+        Label:
+          default: "On Premises Configurations [Optional]"
+        Parameters:
+          - VpnIPCustomer
+          - OnPremDNSIp
+          - OnPremDomainName
+    ParameterLabels:
+      SSHKeyName:
+        default: "SSH Key Pair Name"
+      LatestAMIId:
+        default: "AMI Id"
+      VpnIPCustomer:
+        default: "VPN Customer Gateway IP"
+      OnPremDNSIp:
+        default: "On Premises DNS IPs"
+      OnPremDomainName:
+        default: "On Premises Domain Name"
+
+Parameters:
+  SSHKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Choose a SSH key for the instances
+  LatestAMIId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+  VpnIPCustomer:
+    Type: String
+    Description: "Internet Facing Ip of the customer"
+    Default: ""
+  OnPremDNSIp:
+    Type: String
+    Description: "On Premises DNS Server IPs"
+    Default: ""
+  OnPremDomainName:
+    Type: String
+    Description: "On Premises Domain Name"
+    Default: ""
+
+Outputs:
+  ProductionHostPrivateIP:
+    Value: !GetAtt ProductionHost.PrivateIp
+  DevelopmentHostPrivateIP:
+    Value: !GetAtt DevelopmentHost.PrivateIp
+  BastionHostPublicIP:
+    Value: !GetAtt BastionHost.PublicIp
+
+Conditions:
+  CreateVPNConnection: !Not [ !Equals [!Ref VpnIPCustomer, ""] ]
+  CreateOutboundRuleToOnPrem: !Not [ !Equals [!Ref OnPremDNSIp, ""] ]
+
+Resources: 
+# ***************************************************************************************************************************
+# 1 - VPCs Definition
+#               172.16.1.0/24 -> Production VPC
+#               172.16.2.0/24 -> Development VPC
+#               172.16.3.0/24 -> Egress VPC
+#               172.16.4.0/24 -> Bastion VPC
+# ***************************************************************************************************************************
+
+# ***************************************************************************************************************************
+# Production VPC -> 1 Subnet / 1 Security Group / 1 Route Table
+# ***************************************************************************************************************************
+  ProductionVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.16.1.0/24
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+      - Key: Name
+        Value: "Production VPC"
+
+  FirstSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      CidrBlock: 172.16.1.0/28
+      Tags:
+      - Key: Name
+        Value: "Production VPC Subnet"
+      VpcId: !Ref ProductionVPC
+
+  FirstSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "Production VPC inbound SSH only"
+      GroupDescription: "Allow SSH from anywhere"
+      VpcId: !Ref ProductionVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          ToPort: 22
+          FromPort: 0
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: icmp
+          ToPort: -1
+          FromPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: "Production VPC Security Group"
+
+  FirstSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref FirstRouteTable
+      SubnetId: !Ref FirstSubnet
+
+  FirstRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ProductionVPC
+      Tags:
+      - Key: Name
+        Value: "Production VPC Main Route Table"
+
+# ***************************************************************************************************************************
+# Development VPC -> 1 Subnet / 1 Security Group / 1 Route Table
+# ***************************************************************************************************************************
+  DevelopmentVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.16.2.0/24
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+      - Key: Name
+        Value: "Development VPC"
+
+  SecondSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      CidrBlock: 172.16.2.0/28
+      Tags:
+      - Key: Name
+        Value: "Development VPC First Subnet"
+      VpcId: !Ref DevelopmentVPC
+
+  SecondSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "Second VPC inbound SSH only"
+      GroupDescription: "Allow SSH from anywhere"
+      VpcId: !Ref DevelopmentVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          ToPort: 22
+          FromPort: 0
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: icmp
+          ToPort: -1
+          FromPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: "Development VPC Security Group"
+
+  SecondSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref SecondRouteTable
+      SubnetId: !Ref SecondSubnet
+
+  SecondRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref DevelopmentVPC
+      Tags:
+      - Key: Name
+        Value: "Development VPC Main Route Table"
+
+# ***************************************************************************************************************************
+# Shared Services VPC -> 2 Private Subnet / 1 Security Group / 2 Route Table
+# ***************************************************************************************************************************
+  SharedServicesVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.17.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+      - Key: Name
+        Value: "Shared Services VPC"
+
+  SharedServicesSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      CidrBlock: 172.17.1.0/24
+      Tags:
+      - Key: Name
+        Value: "SharedServices VPC First Subnet"
+      VpcId: !Ref SharedServicesVPC
+
+  SharedServicesSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}b"
+      CidrBlock: 172.17.2.0/24
+      Tags:
+      - Key: Name
+        Value: "SharedServices VPC Second Subnet"
+      VpcId: !Ref SharedServicesVPC
+
+  SharedServicesSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref SharedServicesRouteTableA
+      SubnetId: !Ref SharedServicesSubnetA
+
+  SharedServicesSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref SharedServicesRouteTableB
+      SubnetId: !Ref SharedServicesSubnetB
+
+  SharedServicesRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SharedServicesVPC
+      Tags:
+      - Key: Name
+        Value: "SharedServices VPC Subnet A Main Route Table"
+
+  SharedServicesRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref SharedServicesVPC
+      Tags:
+      - Key: Name
+        Value: "SharedServices VPC Subnet B Main Route Table"
+
+  SharedServicesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "Shared Services VPC inbound SSH and HTTP/HTTPS only"
+      GroupDescription: "Allow HTTP/HTTPS from anywhere"
+      VpcId: !Ref SharedServicesVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          ToPort: 80
+          FromPort: 0
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          ToPort: 443
+          FromPort: 0
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          ToPort: 22
+          FromPort: 0
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: icmp
+          ToPort: -1
+          FromPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: "Shared Services VPC Security Group "
+
+# ***************************************************************************************************************************
+# Egress VPC -> 1 Private Subnet / 1 Public Subnet (1 Internet Gateway/ 1 NAT Gateway) / 2 Route Table
+# ***************************************************************************************************************************
+  EgressVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.16.3.0/24
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+      - Key: Name
+        Value: "Egress VPC"
+
+  EgressPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      CidrBlock: 172.16.3.0/28
+      Tags:
+      - Key: Name
+        Value: "Egress VPC Public Subnet"
+      VpcId: !Ref EgressVPC
+
+  EgressPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      CidrBlock: 172.16.3.16/28
+      Tags:
+      - Key: Name
+        Value: "Egress VPC Private Subnet"
+      VpcId: !Ref EgressVPC
+
+  EgressVPCInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: 
+      Tags:
+      - Key: Name
+        Value: "Egress VPC Internet Gateway"
+
+  EgressVPCInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: 
+      InternetGatewayId: !Ref EgressVPCInternetGateway
+      VpcId: !Ref EgressVPC
+
+  NatGatewayElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: EgressVPCInternetGatewayAttachment
+    Properties: 
+      Domain: vpc
+      Tags:
+      - Key: Name
+        Value: "Nat Gateway Elastic Ip"
+
+  EgreesVPCNatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties: 
+      AllocationId: !GetAtt NatGatewayElasticIP.AllocationId
+      SubnetId: !Ref EgressPublicSubnet
+      Tags:
+      - Key: Name
+        Value: "Nat Gateway"
+
+  EgressPublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EgressVPC
+      Tags:
+        - Key: Name
+          Value: "Egress VPC Public Subnet main route table"
+
+  EgressPrivateSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EgressVPC
+      Tags:
+        - Key: Name
+          Value: "Egress VPC Private Subnet main route table"
+
+  EgressPublicSubnetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: EgressVPCInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref EgressPublicSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref EgressVPCInternetGateway
+
+  EgressPrivateSubnetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: EgressVPCInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref EgressPrivateSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref EgreesVPCNatGateway
+
+  EgressVPCPublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref EgressPublicSubnet
+      RouteTableId: !Ref EgressPublicSubnetRouteTable
+
+  EgressVPCPrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref EgressPrivateSubnet
+      RouteTableId: !Ref EgressPrivateSubnetRouteTable
+
+# ***************************************************************************************************************************
+# Bastion VPC -> 1 Public Subnet (1 Internet Gateway) / 1 Security Group / 1 Route Table
+# ***************************************************************************************************************************
+  BastionVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.16.4.0/24
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+      - Key: Name
+        Value: "Bastion VPC"
+
+  BastionPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      CidrBlock: 172.16.4.0/28
+      Tags:
+      - Key: Name
+        Value: "Bastion VPC Public Subnet"
+      VpcId: !Ref BastionVPC
+
+  BastionVPCInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: 
+      Tags:
+      - Key: Name
+        Value: "Bastion VPC Internet Gateway"
+
+  BastionVPCInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: 
+      InternetGatewayId: !Ref BastionVPCInternetGateway
+      VpcId: !Ref BastionVPC
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "Bastion VPC inbound SSH only"
+      GroupDescription: "Allow SSH from anywhere"
+      VpcId: !Ref BastionVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          ToPort: 22
+          FromPort: 0
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: icmp
+          ToPort: -1
+          FromPort: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: "Bastion VPC Security Group"
+
+  BastionPublicSubnetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BastionVPC
+      Tags:
+        - Key: Name
+          Value: "Bastion VPC Public Subnet main route table"
+
+  BastionPublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: BastionPublicSubnetRouteTable
+    Properties:
+      RouteTableId: !Ref BastionPublicSubnetRouteTable
+      SubnetId: !Ref BastionPublicSubnet
+
+  BastionPublicSubnetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: BastionVPCInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref BastionPublicSubnetRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref BastionVPCInternetGateway
+
+# ***************************************************************************************************************************
+# 2 - VPCs Hosts Creation
+#               Production Host -> Production VPC
+#               Development Host -> Development VPC
+#               Bastion Host -> Bastion VPC
+# ***************************************************************************************************************************
+  ProductionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAMIId
+      InstanceType: t2.micro
+      SubnetId: !Ref FirstSubnet
+      KeyName: !Ref SSHKeyName
+      SecurityGroupIds:
+      - !Ref FirstSecurityGroup
+      Tags:
+      - Key: Name
+        Value: "Production EC2 host"
+
+  DevelopmentHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAMIId
+      InstanceType: t2.micro
+      SubnetId: !Ref SecondSubnet
+      KeyName: !Ref SSHKeyName
+      SecurityGroupIds:
+      - !Ref SecondSecurityGroup
+      Tags:
+      - Key: Name
+        Value: "Development EC2 host"
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    DependsOn: BastionPublicSubnetRoute
+    Properties:
+      ImageId: !Ref LatestAMIId
+      InstanceType: t2.micro
+      KeyName: !Ref SSHKeyName
+      NetworkInterfaces:
+      - AssociatePublicIpAddress : true
+        DeviceIndex: 0
+        GroupSet: 
+          - Ref: BastionSecurityGroup
+        SubnetId: !Ref BastionPublicSubnet
+      Tags:
+      - Key: Name
+        Value: "Bastion EC2 host"
+
+# ***************************************************************************************************************************
+# 3 - Transit Gateway Creation 
+#               Transit Gateway
+#               TGW Attachments 
+#               TGW RouteTables
+#               VPCs RouteTables Updates
+# ***************************************************************************************************************************
+
+# ***************************************************************************************************************************
+# Transit Gateway Creation and Attachments
+# ***************************************************************************************************************************
+  TransitGateway:
+    Type: "AWS::EC2::TransitGateway"
+    Properties:
+      AmazonSideAsn: 64600
+      DnsSupport: enable
+      VpnEcmpSupport: enable
+      DefaultRouteTableAssociation: disable
+      DefaultRouteTablePropagation: disable
+      Description: TGW Route Integration Test
+      Tags:
+      - Key: Name
+        Value: "Transit Gateway"
+
+  ProductionVPCAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    DependsOn: TransitGateway
+    Properties:
+      SubnetIds:
+      - !Ref FirstSubnet
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref ProductionVPC
+      Tags:
+      - Key: Name
+        Value: "Production VPC Attachment"
+
+  DevelopmentVPCAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    DependsOn: TransitGateway
+    Properties:
+      SubnetIds:
+      - !Ref SecondSubnet
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref DevelopmentVPC
+      Tags:
+      - Key: Name
+        Value: "Development VPC Attachment"
+
+  SharedServicesVPCAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    DependsOn: TransitGateway
+    Properties:
+      SubnetIds:
+      - !Ref SharedServicesSubnetA
+      - !Ref SharedServicesSubnetB
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref SharedServicesVPC
+      Tags:
+      - Key: Name
+        Value: "Shared Services VPC Attachment"
+
+  EgressVPCAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    DependsOn: TransitGateway
+    Properties:
+      SubnetIds:
+      - !Ref EgressPrivateSubnet
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref EgressVPC
+      Tags:
+      - Key: Name
+        Value: "Egress VPC Attachment"
+
+  BastionVPCAttachment:
+    Type: AWS::EC2::TransitGatewayAttachment
+    DependsOn: TransitGateway
+    Properties:
+      SubnetIds:
+      - !Ref BastionPublicSubnet
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref BastionVPC
+      Tags:
+      - Key: Name
+        Value: "Bastion VPC Attachment"
+
+# ***************************************************************************************************************************
+# Transit Gateway RouteTables
+# ***************************************************************************************************************************
+
+# ***************************************************************************************************************************
+# Transit Gateway Main VPCs (production and development VPCs) Route Table:
+#                 1. RouteTable
+#                 2. RouteTable Associations (Production/Development)
+#                 3. Routes
+# ***************************************************************************************************************************
+  TGWMainVPCsRouteTable:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags: 
+      - Key: Name
+        Value: "Transit Gateway Main VPCs Route Table"
+
+  RouteTableAssociationProductionVPC:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties: 
+      TransitGatewayAttachmentId: !Ref ProductionVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWMainVPCsRouteTable
+
+  RouteTableAssociationDevelopmentVPC:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties: 
+      TransitGatewayAttachmentId: !Ref DevelopmentVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWMainVPCsRouteTable
+
+  TGWMainVPCsRouteTableProductionVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWMainVPCsRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt ProductionVPC.CidrBlock
+      TransitGatewayRouteTableId: !Ref TGWMainVPCsRouteTable
+      Blackhole: true
+
+  TGWMainVPCsRouteTableDevelopmentVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWMainVPCsRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt DevelopmentVPC.CidrBlock
+      TransitGatewayRouteTableId: !Ref TGWMainVPCsRouteTable
+      Blackhole: true
+
+  TGWMainVPCsRouteTableEgressVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWMainVPCsRouteTable
+    Properties: 
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayAttachmentId: !Ref EgressVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWMainVPCsRouteTable
+
+  TGWMainVPCsRouteTableBastionVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWMainVPCsRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt BastionVPC.CidrBlock
+      TransitGatewayAttachmentId: !Ref BastionVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWMainVPCsRouteTable
+
+  TGWMainVPCsRouteTableSharedServicesVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWMainVPCsRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt SharedServicesVPC.CidrBlock
+      TransitGatewayAttachmentId: !Ref SharedServicesVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWMainVPCsRouteTable
+
+# ***************************************************************************************************************************
+# Transit Gateway Shared VPCs (Shared Services, Egress and Bastion VPCs) Route Table:
+#                 1. RouteTable
+#                 2. RouteTable Associations (Shared Services/Egress and Bastion)
+#                 3. Routes
+# ***************************************************************************************************************************
+  TGWSharedVPCsRouteTable:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags: 
+      - Key: Name
+        Value: "Transit Gateway Shared VPCs Route Table"
+
+  RouteTableAssociationSharedServicesVPC:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties: 
+      TransitGatewayAttachmentId: !Ref SharedServicesVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWSharedVPCsRouteTable
+
+  RouteTableAssociationEgressVPC:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties: 
+      TransitGatewayAttachmentId: !Ref EgressVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWSharedVPCsRouteTable
+
+  RouteTableAssociationBastionVPC:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties: 
+      TransitGatewayAttachmentId: !Ref BastionVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWSharedVPCsRouteTable
+
+  TGWSharedVPCsRouteTableProductionVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWSharedVPCsRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt ProductionVPC.CidrBlock
+      TransitGatewayAttachmentId: !Ref ProductionVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWSharedVPCsRouteTable
+
+  TGWSharedVPCsRouteTableDevelopmentVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWSharedVPCsRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt DevelopmentVPC.CidrBlock
+      TransitGatewayAttachmentId: !Ref DevelopmentVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWSharedVPCsRouteTable
+
+  TGWSharedVPCsRouteTableSharedServicesVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWSharedVPCsRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt SharedServicesVPC.CidrBlock
+      TransitGatewayAttachmentId: !Ref SharedServicesVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWSharedVPCsRouteTable
+
+  TGWSharedVPCsRouteTableBastionVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWSharedVPCsRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt BastionVPC.CidrBlock
+      TransitGatewayAttachmentId: !Ref BastionVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWSharedVPCsRouteTable
+
+  TGWSharedVPCsRouteTableEgressVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWSharedVPCsRouteTable
+    Properties: 
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayAttachmentId: !Ref EgressVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWSharedVPCsRouteTable
+
+# ***************************************************************************************************************************
+# Transit Gateway Main VPCs (production and development VPCs) Route Table:
+#                 1. RouteTable
+#                 2. RouteTable Associations (Production/Development)
+#                 3. Routes
+# *************************************************************************************************************************** 
+  TGWOnPremRouteTable:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      Tags: 
+      - Key: Name
+        Value: "Transit Gateway ONPrem Route Table"
+
+  TGWOnPremRouteTableTableProductionVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWOnPremRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt ProductionVPC.CidrBlock
+      TransitGatewayAttachmentId: !Ref ProductionVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWOnPremRouteTable
+
+  TGWOnPremRouteTableDevelopmentVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWOnPremRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt DevelopmentVPC.CidrBlock
+      TransitGatewayAttachmentId: !Ref DevelopmentVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWOnPremRouteTable
+
+  TGWOnPremRouteTableSharedServicesVPCRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: TGWOnPremRouteTable
+    Properties: 
+      DestinationCidrBlock: !GetAtt SharedServicesVPC.CidrBlock
+      TransitGatewayAttachmentId: !Ref SharedServicesVPCAttachment
+      TransitGatewayRouteTableId: !Ref TGWOnPremRouteTable
+
+# ***************************************************************************************************************************
+# VPCs RouteTables Updates
+# ***************************************************************************************************************************
+  ProductionVPCRouteToTGW:
+    Type: AWS::EC2::Route
+    DependsOn: ProductionVPCAttachment
+    Properties:
+      RouteTableId: !Ref FirstRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      TransitGatewayId: !Ref TransitGateway
+
+  DevelopmentVPCRouteToTGW:
+    Type: AWS::EC2::Route
+    DependsOn: DevelopmentVPCAttachment
+    Properties:
+       RouteTableId: !Ref SecondRouteTable
+       DestinationCidrBlock: 0.0.0.0/0
+       TransitGatewayId: !Ref TransitGateway
+
+  SharedServicesVPCARouteToTGW:
+    Type: AWS::EC2::Route
+    DependsOn: SharedServicesVPCAttachment
+    Properties:
+       RouteTableId: !Ref SharedServicesRouteTableA
+       DestinationCidrBlock: 0.0.0.0/0
+       TransitGatewayId: !Ref TransitGateway
+
+  SharedServicesVPCBRouteToTGW:
+    Type: AWS::EC2::Route
+    DependsOn: SharedServicesVPCAttachment
+    Properties:
+       RouteTableId: !Ref SharedServicesRouteTableB
+       DestinationCidrBlock: 0.0.0.0/0
+       TransitGatewayId: !Ref TransitGateway
+
+  EgressPublicSubnetRouteToProductionVPC:
+    Type: AWS::EC2::Route
+    DependsOn: EgressVPCAttachment
+    Properties:
+      RouteTableId: !Ref EgressPublicSubnetRouteTable
+      DestinationCidrBlock: !GetAtt ProductionVPC.CidrBlock
+      TransitGatewayId: !Ref TransitGateway
+
+  EgressPublicSubnetRouteToDevelopmentVPC:
+    Type: AWS::EC2::Route
+    DependsOn: EgressVPCAttachment
+    Properties:
+      RouteTableId: !Ref EgressPublicSubnetRouteTable
+      DestinationCidrBlock: !GetAtt DevelopmentVPC.CidrBlock
+      TransitGatewayId: !Ref TransitGateway
+
+  EgressPublicSubnetRouteToSharedVPCs:
+    Type: AWS::EC2::Route
+    DependsOn: EgressVPCAttachment
+    Properties:
+      RouteTableId: !Ref EgressPublicSubnetRouteTable
+      DestinationCidrBlock: !GetAtt SharedServicesVPC.CidrBlock
+      TransitGatewayId: !Ref TransitGateway
+
+  BastionSubnetRouteToProductionVPC:
+    Type: AWS::EC2::Route
+    DependsOn: BastionVPCAttachment
+    Properties:
+      RouteTableId: !Ref BastionPublicSubnetRouteTable
+      DestinationCidrBlock: !GetAtt ProductionVPC.CidrBlock
+      TransitGatewayId: !Ref TransitGateway
+
+  BastionSubnetRouteToDevelopmentVPC:
+    Type: AWS::EC2::Route
+    DependsOn: BastionVPCAttachment
+    Properties:
+      RouteTableId: !Ref BastionPublicSubnetRouteTable
+      DestinationCidrBlock: !GetAtt DevelopmentVPC.CidrBlock
+      TransitGatewayId: !Ref TransitGateway
+
+  BastionSubnetRouteToSharedVPCs:
+    Type: AWS::EC2::Route
+    DependsOn: BastionVPCAttachment
+    Properties:
+      RouteTableId: !Ref BastionPublicSubnetRouteTable
+      DestinationCidrBlock: !GetAtt SharedServicesVPC.CidrBlock
+      TransitGatewayId: !Ref TransitGateway
+
+# ***************************************************************************************************************************
+# 4 - VPN Resources Creation
+#               4.1 Customer Gateway
+#               4.2 VPN Connection
+# ***************************************************************************************************************************
+  CustomerGateway:
+    Type: AWS::EC2::CustomerGateway
+    Condition: CreateVPNConnection
+    Properties: 
+      BgpAsn: 65000
+      IpAddress: !Ref VpnIPCustomer
+      Type: ipsec.1
+      Tags: 
+      - Key: Name
+        Value: "Customer Gateway VPN Connection"
+
+  VPNConnection:
+    Type: AWS::EC2::VPNConnection
+    Condition: CreateVPNConnection
+    Properties:
+      CustomerGatewayId: !Ref CustomerGateway
+      StaticRoutesOnly: true
+      TransitGatewayId: !Ref TransitGateway
+      Type: ipsec.1
+      Tags: 
+      - Key: Name
+        Value: "VPN Connection"
+
+# ***************************************************************************************************************************
+# 5 - Route 53 Resolvers
+#               5.1 Inbound Resolver (Security Group and Resolver Endpoint)
+#               5.2 Outbound Resolver (Security Group and Resolver Endpoint)
+#               5.3 Outbound Rule to OnPrem
+# ***************************************************************************************************************************
+  InboundEndpointResolverSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Inbound requests
+      VpcId: !Ref SharedServicesVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          ToPort: 53
+          FromPort: 0
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          ToPort: 53
+          FromPort: 0
+          CidrIp: 0.0.0.0/0
+      Tags: 
+      - Key: Name
+        Value: "Inbound Endpoint Security Group"
+
+  InboundEndpointResolver:
+    Type: AWS::Route53Resolver::ResolverEndpoint
+    DependsOn:
+    - SharedServicesSubnetA
+    - SharedServicesSubnetB
+    Properties: 
+      Direction: INBOUND
+      IpAddresses: 
+      - SubnetId: !Ref SharedServicesSubnetA
+      - SubnetId: !Ref SharedServicesSubnetB
+      Name: Inbound Resolver
+      SecurityGroupIds: 
+      - !Ref InboundEndpointResolverSecurityGroup
+
+  OutputEndpointResolverSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Inbound requests and all outbounds
+      VpcId: !Ref SharedServicesVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          ToPort: 53
+          FromPort: 0
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          ToPort: 53
+          FromPort: 0
+          CidrIp: 0.0.0.0/0
+      Tags: 
+      - Key: Name
+        Value: "Outbound Endpoint Security Group"
+
+  OutputEndpointResolver:
+    Type: AWS::Route53Resolver::ResolverEndpoint
+    DependsOn:
+    - SharedServicesSubnetA
+    - SharedServicesSubnetB
+    Properties: 
+      Direction: OUTBOUND
+      IpAddresses: 
+      - SubnetId: !Ref SharedServicesSubnetA
+      - SubnetId: !Ref SharedServicesSubnetB
+      Name: Outbound Resolver
+      SecurityGroupIds: 
+      - !Ref OutputEndpointResolverSecurityGroup
+
+# ***************************************************************************************************************************
+# 5.3 Resolver OutBound Rule to On Premises and Rule Associations
+# ***************************************************************************************************************************
+  OutboundRuleToOnPrem:
+    Type: AWS::Route53Resolver::ResolverRule
+    Condition: CreateOutboundRuleToOnPrem
+    DependsOn: OutputEndpointResolver
+    Properties:
+      DomainName: OnPremDomainName
+      Name: "Outbound Rule To OnPremises"
+      ResolverEndpointId: !Ref OutputEndpointResolver
+      RuleType: FORWARD
+      TargetIps: 
+        - Ip: !Ref OnPremDNSIp
+          Port: 53
+
+  OutboundRuleToOnPremProductionAssociation:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Condition: CreateOutboundRuleToOnPrem
+    DependsOn: OutboundRuleToOnPrem
+    Properties:
+      Name: "Outbound rule association with Production VPC"
+      ResolverRuleId: !Ref OutboundRuleToOnPrem
+      VPCId: !Ref ProductionVPC
+
+  OutboundRuleToOnPremDevelopmentAssociation:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Condition: CreateOutboundRuleToOnPrem
+    DependsOn: OutboundRuleToOnPrem
+    Properties:
+      Name: "Outbound rule association with Development VPC"
+      ResolverRuleId: !Ref OutboundRuleToOnPrem
+      VPCId: !Ref DevelopmentVPC
+
+  OutboundRuleToOnPremSharedServicesAssociation:
+    Type: AWS::Route53Resolver::ResolverRuleAssociation
+    Condition: CreateOutboundRuleToOnPrem
+    DependsOn: OutboundRuleToOnPrem
+    Properties:
+      Name: "Outbound rule association with SharedServices VPC"
+      ResolverRuleId: !Ref OutboundRuleToOnPrem
+      VPCId: !Ref SharedServicesVPC
+
+# ***************************************************************************************************************************
+# 6 - VPCs Endpoint (SQS and S3)
+#               6.1 SQS Endpoint (Creates SQS endpoint and Private Hosted Zones)
+#               6.2 Outbound Resolver (Security Group and Resolver Endpoint)
+# ***************************************************************************************************************************
+  SQSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref SharedServicesVPC
+      SubnetIds:
+        - !Ref SharedServicesSubnetA
+        - !Ref SharedServicesSubnetB
+      SecurityGroupIds:
+        - !Ref SharedServicesSecurityGroup
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sqs
+
+  SQSEndpointPHZ:
+    Type: AWS::Route53::HostedZone
+    Properties: 
+      HostedZoneConfig: 
+        Comment: 'Private Hosted Zone for SQS service Endpoint'
+      Name: !Sub sqs.${AWS::Region}.amazonaws.com
+      VPCs: 
+        - VPCId: !Ref ProductionVPC
+          VPCRegion: !Ref "AWS::Region"
+        - VPCId: !Ref DevelopmentVPC
+          VPCRegion: !Ref "AWS::Region"
+        - VPCId: !Ref SharedServicesVPC
+          VPCRegion: !Ref "AWS::Region"
+
+  SQSEndpointRecordSet:
+    Type: AWS::Route53::RecordSet
+    DependsOn: SQSEndpointPHZ
+    Properties:
+      HostedZoneId: !Ref SQSEndpointPHZ
+      Name: !Sub sqs.${AWS::Region}.amazonaws.com
+      Type: A
+      AliasTarget:
+        DNSName: !Select [1, !Split [ ":" , !Select [ 0, !GetAtt SQSEndpoint.DnsEntries ] ] ]
+        HostedZoneId: !Select [0, !Split [ ":" , !Select [ 0, !GetAtt SQSEndpoint.DnsEntries ] ] ]
+
+#  S3Endpoint:
+#    Type: AWS::EC2::VPCEndpoint
+#    Properties:
+#      VpcEndpointType: Gateway
+#      VpcId: !Ref SharedServicesVPC
+#      RouteTableIds:
+#        - !Ref SharedServicesRouteTableA
+#        - !Ref SharedServicesRouteTableB
+#      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
